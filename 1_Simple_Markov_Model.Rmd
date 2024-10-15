@@ -1,0 +1,214 @@
+---
+title: "Conducting CEA in R"
+author: "Ashutosh Kumar"
+date: "2024-10-10"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this document, we are calculating incremental cost-effectiveness ratio (ICER) using simple markov model.
+
+## 1. Load packages
+
+```{r}
+if (!require('pacman')) install.packages('pacman'); library(pacman)
+# load (install if required) packages from CRAN
+p_load("kableExtra", "magrittr", "ggplot2", "dplyr", "stargazer")
+```
+
+## 2. Define transition matrix with Standard of Care (SoC)
+
+```{r}
+p_hd <- 0.002   # constant probability of dying when Healthy (all-cause mortality)
+p_hs1 <- 0.15   # probability of becoming Sick when Healthy
+p_s1h <- 0.5    # probability of becoming Healthy when Sick
+p_s1s2 <- 0.105 # probability of becoming Sicker when Sick
+p_s1d <- 0.006  # constant probability of dying when Sick
+p_s2d <- 0.02   # constant probability of dying when Sicker
+p_hh <- 1 - p_hs1 - p_hd
+p_s1s1 <- 1 - p_s1h - p_s1s2 - p_s1d
+p_s2s2 <- 1 - p_s2d
+
+p_soc <- matrix(
+c(p_hh, p_hs1, 0, p_hd,
+p_s1h, p_s1s1, p_s1s2, p_s1d,
+0, 0, p_s2s2, p_s2d,
+0, 0, 0, 1),
+byrow = TRUE,
+nrow = 4, ncol = 4
+)
+state_names <- c("H", "S1", "S2", "D")
+colnames(p_soc) <- rownames(p_soc) <- state_names
+print(p_soc)
+```
+
+## 3. Relative risk and transition matrix with new treatment
+
+```{r}
+apply_rr <- function(p, rr = .8){
+  p["H", "S1"] <- p["H", "S1"] * rr
+  p["H", "S2"] <- p["H", "S2"] * rr
+  p["H", "D"] <- p["H", "D"] * rr
+  p["H", "H"] <- 1 - sum(p["H", -1])
+  
+  p["S1", "S2"] <- p["S1", "S2"] * rr
+  p["S1", "D"] <- p["S1", "D"] * rr
+  p["S1", "S1"] <- 1 - sum(p["S1", -2])
+  
+  p["S2", "D"] <- p["S2", "D"] * rr
+  p["S2", "S2"] <- 1 - sum(p["S2", -3])
+  
+  return(p)
+}
+p_new <- apply_rr(p_soc, rr = .8)
+print(p_new)
+```
+
+## 4. Utility and costs for SOC and new treatment
+
+```{r}
+utility <- c(1, .75, 0.5, 0)
+costs_medical <- c(2000, 4000, 15000, 0)
+costs_treat_soc <- c(rep(2000, 3), 0)
+costs_treat_new <- c(rep(12000, 3), 0)
+```
+
+## 5. Simulation
+
+```{r}
+x_init <- c(1, 0, 0, 0)
+
+# State vector at cycle 1
+x_init %*% p_soc  
+
+# State vector at cycle 2
+x_init %*% 
+  p_soc %*% 
+  p_soc 
+
+# Simulating state vectors for multiple cycles
+simulate_sv <- function (x0, p, n_cycles = 85) 
+ {
+     x <- matrix(NA, ncol = length(x0), nrow = n_cycles)
+     x <- rbind(x0, x)
+     colnames(x) <- colnames(p)
+     rownames(x) <- 0:n_cycles
+     for (t in 1:n_cycles) {
+         x[t + 1, ] <- x[t, ] %*% p
+     }
+     return(x)
+ }
+
+x_soc <- simulate_sv(x_init,p = p_soc, n_cycles = 85)
+x_new <- simulate_sv(x_init,p = p_new, n_cycles = 85)
+
+head(x_soc)
+head(x_new)
+
+```
+
+## 6. Expected costs and quality-adjusted life-years (QALY)
+
+```{r}
+# Function to calculate present value
+cal_pv <- function (z, dr, t) 
+ {
+     z/(1 + dr)^t
+}
+
+# QALYs
+x_soc[2, ] # State occupancy probabilities after 1st cycle
+
+invisible(sum(x_soc[2, 1:3]))             # Expected life-years after 1st cycle for SOC
+invisible(sum(x_soc[2, ] * utility))      # Expected utility after 1st cycle for SOC
+sum(cal_pv(x_soc[2, ] * utility, .03, 1)) # Expected discounted utility after 1st cycle for SOC
+
+# Function to compute expected (discounted) QALYs for each cycle
+compute_qalys <- function(x, utility, dr = .03){
+  n_cycles <- nrow(x) - 1
+  cal_pv(x %*% utility, dr, 0:n_cycles)
+}
+# Non-discounted QALYS
+qalys_soc <- x_soc %*% utility
+
+# Discounted QALYS
+dqalys_soc <- compute_qalys(x_soc, utility = utility)
+dqalys_new <- compute_qalys(x_new, utility = utility)
+
+head(qalys_soc)
+head(dqalys_soc)
+head(dqalys_new)
+
+```
+
+## 7. Costs
+
+```{r}
+# Function to compute discounted costs taking inputs for medical and treatment costs 
+compute_costs <- function(x, costs_medical, costs_treat, dr = .03){
+  n_cycles <- nrow(x) - 1
+  costs <- cbind(
+    cal_pv(x %*% costs_medical, dr, 0:n_cycles),
+    cal_pv(x %*% costs_treat, dr, 0:n_cycles)
+  )
+  colnames(costs) <- c("medical", "treatment")
+  return(costs)
+}
+
+# Calculate discounted costs
+dcosts_soc <- compute_costs(x_soc, costs_medical, costs_treat_soc)
+dcosts_new <- compute_costs(x_new, costs_medical, costs_treat_new)
+
+head(dcosts_soc)
+head(dcosts_new)
+
+```
+
+## 8. Cost-effectiveness Analysis
+
+```{r}
+ICER <- (sum(dcosts_new[-1, ]) - sum(dcosts_soc[-1, ])) /
+(sum(dqalys_new[-1, ]) - sum(dqalys_soc[-1, ]))
+
+print(ICER)
+```
+
+## 9. Get a nice looking table
+
+```{r}
+format_costs <- function(x) formatC(x, format = "d", big.mark = ",")
+format_qalys <- function(x) formatC(x, format = "f", digits = 2)
+make_icer_tbl <- function(costs0, costs1, qalys0, qalys1){
+  # Computations
+  total_costs0 <- sum(costs0)
+  total_costs1 <- sum(costs1)
+  total_qalys0 <- sum(qalys0)
+  total_qalys1 <- sum(qalys1)
+  incr_total_costs <- total_costs1 - total_costs0
+  inc_total_qalys <- total_qalys1 - total_qalys0
+  icer <- incr_total_costs/inc_total_qalys
+  
+  # Make table
+  tibble(
+    `Strategy` = c("SOC", "New"),
+    `Costs` = c(total_costs0, total_costs1) %>%
+      format_costs(), 
+    `QALYs` = c(total_qalys0, total_qalys1) %>%
+      format_qalys(),
+    `Incremental costs` = c("--", incr_total_costs %>% 
+                             format_costs()),
+    `Incremental QALYs` = c("--", inc_total_qalys %>% 
+                             format_qalys()),
+    `ICER` = c("--", icer %>% format_costs())
+  ) %>%
+    kable() %>%
+    kable_styling() %>%
+    footnote(general = "Costs and QALYs are discounted at 3% per annum.",
+             footnote_as_chunk = TRUE)
+}
+make_icer_tbl(costs0 = dcosts_soc[-1, ], costs1 = dcosts_new[-1, ],
+              qalys0 = dqalys_soc[-1, ], qalys1 = dqalys_new[-1, ])
+```
